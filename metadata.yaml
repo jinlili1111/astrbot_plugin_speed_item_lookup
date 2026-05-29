@@ -1,0 +1,9 @@
+name: astrbot_plugin_speed_item_lookup
+display_name: QQ飞车物品图鉴查询
+desc: 群内发送物品ID时，查询 QQ 飞车物品名称并发送 iips.speed.qq.com 对应 PNG。
+version: v1.0.0
+author: jinlili1111
+repo: https://github.com/jinlili1111/astrbot_plugin_speed_item_lookup
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.0.0"
