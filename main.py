@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -17,6 +18,8 @@ class SpeedItemLookupPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.items: dict[str, dict[str, str]] = {}
+        self.name_index: list[tuple[str, str, str, str, str]] = []
+        self.pending_choices: dict[str, dict[str, Any]] = {}
 
     async def initialize(self):
         await asyncio.to_thread(self._load_items)
@@ -24,48 +27,74 @@ class SpeedItemLookupPlugin(Star):
             f"SpeedItemLookupPlugin initialized, loaded {len(self.items)} item names"
         )
 
-    @filter.regex(r"^\s*\d+\s*$")
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.command("itemid", alias={"物品", "道具"})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def lookup_speed_item(self, event: AstrMessageEvent):
-        item_id = event.get_message_str().strip()
+        event.should_call_llm(False)
         group_id = str(event.get_group_id() or "").strip()
-
         if not self._group_allowed(group_id):
             return
 
-        if not self._valid_id_length(item_id):
-            event.should_call_llm(False)
+        query = self._extract_query(event.get_message_str())
+        if not query:
+            yield event.plain_result(self._usage_text()).stop_event()
             return
 
-        event.should_call_llm(False)
+        selected_id = self._resolve_pending_choice(event, query)
+        if selected_id:
+            result = await self._build_item_result(event, selected_id)
+            if result:
+                yield result.stop_event()
+            return
+
+        if query.isdigit():
+            result = await self._build_item_result(event, query)
+            if result:
+                yield result.stop_event()
+            return
+
+        matches = self._search_by_name(query)
+        if not matches:
+            yield event.plain_result(f"没有找到名称包含「{query}」的物品。").stop_event()
+            return
+
+        if len(matches) == 1:
+            result = await self._build_item_result(event, matches[0])
+            if result:
+                yield result.stop_event()
+            return
+
+        self._store_pending_choices(event, query, matches)
+        yield event.plain_result(self._format_choices(query, matches)).stop_event()
+
+    async def _build_item_result(self, event: AstrMessageEvent, item_id: str):
         item = self.items.get(item_id)
         if not item:
-            if self._get_bool("reply_when_not_found", False):
-                yield event.plain_result(f"未收录物品ID：{item_id}").stop_event()
-            return
-
-        if self._get_bool("only_cars_and_skins", True) and item.get("type") not in {
-            "EAIT_CAR",
-            "EAIT_SKIN",
-        }:
-            return
+            image_url = self._image_url(item_id)
+            image_exists = await asyncio.to_thread(self._url_exists, image_url)
+            if not image_exists and self._get_bool("silent_on_image_404", False):
+                return None
+            if not image_exists and not self._get_bool("reply_when_not_found", True):
+                return None
+            chain = [Comp.Plain(f"未收录物品ID：{item_id}")]
+            if image_exists:
+                chain.append(Comp.Image.fromURL(image_url))
+            return event.chain_result(chain)
 
         image_url = self._image_url(item_id)
         image_exists = await asyncio.to_thread(self._url_exists, image_url)
-        if not image_exists and self._get_bool("silent_on_image_404", True):
-            return
 
         title = item.get("name") or f"物品 {item_id}"
         mess = item.get("mess") or item.get("type") or "未知类型"
-        lines = [title, f"ID: {item_id}", f"类型: {mess}"]
+        item_type = item.get("type") or "UNKNOWN"
+        lines = [title, f"ID: {item_id}", f"类型: {mess}", f"Type: {item_type}"]
         if not image_exists:
             lines.append("图片: 未找到")
 
         chain = [Comp.Plain("\n".join(lines))]
         if image_exists:
             chain.append(Comp.Image.fromURL(image_url))
-        yield event.chain_result(chain).stop_event()
+        return event.chain_result(chain)
 
     def _load_items(self):
         data_path = Path(__file__).with_name("data") / "item_names.json"
@@ -82,6 +111,17 @@ class SpeedItemLookupPlugin(Star):
             for item_id, info in raw.items()
             if isinstance(info, dict)
         }
+        self.name_index = [
+            (
+                item_id,
+                info.get("name", ""),
+                info.get("type", ""),
+                info.get("mess", ""),
+                info.get("name", "").casefold(),
+            )
+            for item_id, info in self.items.items()
+            if info.get("name")
+        ]
 
     def _group_allowed(self, group_id: str) -> bool:
         allowed = self._get_list("allowed_group_ids")
@@ -89,10 +129,108 @@ class SpeedItemLookupPlugin(Star):
             return True
         return group_id in {str(value).strip() for value in allowed if str(value).strip()}
 
-    def _valid_id_length(self, item_id: str) -> bool:
-        min_digits = max(1, self._get_int("id_min_digits", 5))
-        max_digits = max(min_digits, self._get_int("id_max_digits", 6))
-        return min_digits <= len(item_id) <= max_digits
+    def _extract_query(self, message: str) -> str:
+        text = re.sub(r"\s+", " ", (message or "").strip())
+        if not text:
+            return ""
+        commands = ("itemid", "/itemid", "物品", "/物品", "道具", "/道具")
+        lowered = text.casefold()
+        for command in commands:
+            command_lower = command.casefold()
+            if lowered == command_lower:
+                return ""
+            if lowered.startswith(command_lower + " "):
+                return text[len(command) :].strip()
+        parts = text.split(" ", 1)
+        if parts[0].casefold().lstrip("/") in {"itemid", "物品", "道具"}:
+            return parts[1].strip() if len(parts) > 1 else ""
+        return text
+
+    def _search_by_name(self, query: str) -> list[str]:
+        needle = query.casefold().strip()
+        if not needle:
+            return []
+        ranked: list[tuple[int, int, int, str]] = []
+        for item_id, name, _item_type, _mess, haystack in self.name_index:
+            if needle not in haystack:
+                continue
+            if haystack == needle:
+                score = 0
+            elif haystack.startswith(needle):
+                score = 1
+            else:
+                score = 2
+            ranked.append((score, len(name), int(item_id), item_id))
+        ranked.sort()
+        limit = max(1, self._get_int("max_search_results", 10))
+        return [item_id for *_prefix, item_id in ranked[:limit]]
+
+    def _format_choices(self, query: str, item_ids: list[str]) -> str:
+        total_matches = self._count_name_matches(query)
+        lines = [f"找到 {total_matches} 个匹配「{query}」的物品，显示前 {len(item_ids)} 个："]
+        for index, item_id in enumerate(item_ids, 1):
+            item = self.items[item_id]
+            name = item.get("name") or "未命名"
+            mess = item.get("mess") or item.get("type") or "未知类型"
+            lines.append(f"{index}. {name} / ID: {item_id} / {mess}")
+        lines.append("继续发送 /itemid 序号 查看，例如：/itemid 1")
+        lines.append("也可以继续输入更精确的名称缩小范围。")
+        return "\n".join(lines)
+
+    def _count_name_matches(self, query: str) -> int:
+        needle = query.casefold().strip()
+        return sum(1 for *_prefix, haystack in self.name_index if needle in haystack)
+
+    def _store_pending_choices(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        item_ids: list[str],
+    ) -> None:
+        self.pending_choices[self._selection_key(event)] = {
+            "query": query,
+            "item_ids": item_ids,
+            "created_at": time.time(),
+        }
+
+    def _resolve_pending_choice(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+    ) -> str | None:
+        choice = query.strip()
+        choice = choice.removeprefix("#")
+        match = re.fullmatch(r"第?(\d+)(?:个)?", choice)
+        if not match:
+            return None
+        selected_index = int(match.group(1))
+        pending = self.pending_choices.get(self._selection_key(event))
+        if not pending:
+            return None
+        ttl = max(10, self._get_int("selection_ttl_sec", 300))
+        if time.time() - float(pending.get("created_at") or 0) > ttl:
+            self.pending_choices.pop(self._selection_key(event), None)
+            return None
+        item_ids = pending.get("item_ids") or []
+        if 1 <= selected_index <= len(item_ids):
+            return str(item_ids[selected_index - 1])
+        return None
+
+    def _selection_key(self, event: AstrMessageEvent) -> str:
+        group_id = str(event.get_group_id() or "private")
+        sender_id = str(event.get_sender_id() or "unknown")
+        return f"{group_id}:{sender_id}"
+
+    @staticmethod
+    def _usage_text() -> str:
+        return "\n".join(
+            [
+                "用法：/itemid 物品ID 或 /itemid 名称",
+                "示例：/itemid 74362",
+                "示例：/itemid 爆天",
+                "多个匹配时，再发送 /itemid 1 查看对应条目。",
+            ]
+        )
 
     def _image_url(self, item_id: str) -> str:
         base_url = str(

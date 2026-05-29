@@ -4,30 +4,15 @@
     "type": "list",
     "default": []
   },
-  "id_min_digits": {
-    "description": "触发查询的最小物品ID位数",
-    "type": "int",
-    "default": 5
-  },
-  "id_max_digits": {
-    "description": "触发查询的最大物品ID位数",
-    "type": "int",
-    "default": 6
-  },
-  "only_cars_and_skins": {
-    "description": "只查询赛车和赛车皮肤",
-    "type": "bool",
-    "default": true
-  },
   "silent_on_image_404": {
-    "description": "图片不存在时静默不回复",
+    "description": "物品ID未收录且图片不存在时静默不回复",
     "type": "bool",
-    "default": true
+    "default": false
   },
   "reply_when_not_found": {
     "description": "物品ID未收录时是否回复提示",
     "type": "bool",
-    "default": false
+    "default": true
   },
   "image_base_url": {
     "description": "QQ飞车物品图片基础地址",
@@ -38,5 +23,15 @@
     "description": "图片存在性检查超时秒数",
     "type": "int",
     "default": 6
+  },
+  "max_search_results": {
+    "description": "名称模糊搜索最多展示多少条候选",
+    "type": "int",
+    "default": 10
+  },
+  "selection_ttl_sec": {
+    "description": "二轮序号筛选的有效期秒数",
+    "type": "int",
+    "default": 300
   }
 }
