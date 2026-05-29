@@ -30,42 +30,76 @@ class SpeedItemLookupPlugin(Star):
     @filter.command("itemid", alias={"物品", "道具"})
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def lookup_speed_item(self, event: AstrMessageEvent):
-        event.should_call_llm(False)
+        query = self._extract_query(event.get_message_str())
+        result = await self._lookup_query(
+            event,
+            query,
+            reply_on_empty=True,
+            reply_on_name_miss=True,
+        )
+        if result:
+            yield result.stop_event()
+
+    @filter.regex(r"^/\s*\S.*")
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def lookup_speed_item_short_slash(self, event: AstrMessageEvent):
+        query = self._extract_short_slash_query(event.get_message_str())
+        result = await self._lookup_query(
+            event,
+            query,
+            reply_on_empty=False,
+            reply_on_name_miss=False,
+        )
+        if result:
+            yield result.stop_event()
+
+    async def _lookup_query(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        *,
+        reply_on_empty: bool,
+        reply_on_name_miss: bool,
+    ):
         group_id = str(event.get_group_id() or "").strip()
         if not self._group_allowed(group_id):
-            return
+            return None
 
-        query = self._extract_query(event.get_message_str())
         if not query:
-            yield event.plain_result(self._usage_text()).stop_event()
-            return
+            if not reply_on_empty:
+                return None
+            event.should_call_llm(False)
+            return event.plain_result(self._usage_text())
 
         selected_id = self._resolve_pending_choice(event, query)
         if selected_id:
             result = await self._build_item_result(event, selected_id)
             if result:
-                yield result.stop_event()
-            return
+                event.should_call_llm(False)
+            return result
 
         if query.isdigit():
             result = await self._build_item_result(event, query)
             if result:
-                yield result.stop_event()
-            return
+                event.should_call_llm(False)
+            return result
 
         matches = self._search_by_name(query)
         if not matches:
-            yield event.plain_result(f"没有找到名称包含「{query}」的物品。").stop_event()
-            return
+            if not reply_on_name_miss:
+                return None
+            event.should_call_llm(False)
+            return event.plain_result(f"没有找到名称包含「{query}」的物品。")
 
         if len(matches) == 1:
             result = await self._build_item_result(event, matches[0])
             if result:
-                yield result.stop_event()
-            return
+                event.should_call_llm(False)
+            return result
 
         self._store_pending_choices(event, query, matches)
-        yield event.plain_result(self._format_choices(query, matches)).stop_event()
+        event.should_call_llm(False)
+        return event.plain_result(self._format_choices(query, matches))
 
     async def _build_item_result(self, event: AstrMessageEvent, item_id: str):
         item = self.items.get(item_id)
@@ -146,6 +180,18 @@ class SpeedItemLookupPlugin(Star):
             return parts[1].strip() if len(parts) > 1 else ""
         return text
 
+    def _extract_short_slash_query(self, message: str) -> str:
+        text = re.sub(r"\s+", " ", (message or "").strip())
+        if not text.startswith("/"):
+            return ""
+        query = text[1:].strip()
+        if not query:
+            return ""
+        command = query.split(" ", 1)[0].casefold()
+        if command in {"itemid", "物品", "道具"}:
+            return ""
+        return query
+
     def _search_by_name(self, query: str) -> list[str]:
         needle = query.casefold().strip()
         if not needle:
@@ -173,7 +219,7 @@ class SpeedItemLookupPlugin(Star):
             name = item.get("name") or "未命名"
             mess = item.get("mess") or item.get("type") or "未知类型"
             lines.append(f"{index}. {name} / ID: {item_id} / {mess}")
-        lines.append("继续发送 /itemid 序号 查看，例如：/itemid 1")
+        lines.append("继续发送 /序号 查看，例如：/1；也可用 /itemid 1")
         lines.append("也可以继续输入更精确的名称缩小范围。")
         return "\n".join(lines)
 
@@ -226,9 +272,10 @@ class SpeedItemLookupPlugin(Star):
         return "\n".join(
             [
                 "用法：/itemid 物品ID 或 /itemid 名称",
+                "也可直接发送 /物品ID 或 /名称，例如：/74362、/爆天",
                 "示例：/itemid 74362",
                 "示例：/itemid 爆天",
-                "多个匹配时，再发送 /itemid 1 查看对应条目。",
+                "多个匹配时，再发送 /1 或 /itemid 1 查看对应条目。",
             ]
         )
 

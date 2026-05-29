@@ -1,7 +1,7 @@
 name: astrbot_plugin_speed_item_lookup
 display_name: QQ飞车物品图鉴查询
-desc: 使用 /itemid 查询 QQ 飞车物品名称、类型和 iips.speed.qq.com 对应 PNG，支持名称模糊搜索。
-version: v1.1.0
+desc: 使用 /物品ID、/名称 或 /itemid 查询 QQ 飞车物品名称、类型和 iips.speed.qq.com 对应 PNG，支持名称模糊搜索。
+version: v1.2.0
 author: jinlili1111
 repo: https://github.com/jinlili1111/astrbot_plugin_speed_item_lookup
 support_platforms:
