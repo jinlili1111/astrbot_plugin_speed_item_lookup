@@ -23,6 +23,8 @@ class SpeedItemLookupPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.items: dict[str, dict[str, str]] = {}
+        self.mysql_items: dict[str, dict[str, str]] = {}
+        self.mysql_name_match_counts: dict[str, int] = {}
         self.name_index: list[tuple[str, str, str, str, str]] = []
         self.pending_choices: dict[str, dict[str, Any]] = {}
 
@@ -92,6 +94,8 @@ class SpeedItemLookupPlugin(Star):
 
         matches = self._search_by_name(query)
         if not matches:
+            matches = await asyncio.to_thread(self._search_mysql_by_name, query)
+        if not matches:
             if not reply_on_name_miss:
                 return None
             event.should_call_llm(False)
@@ -108,7 +112,9 @@ class SpeedItemLookupPlugin(Star):
         return event.plain_result(self._format_choices(query, matches))
 
     async def _build_item_result(self, event: AstrMessageEvent, item_id: str):
-        item = self.items.get(item_id)
+        item = self._get_cached_item(item_id)
+        if not item:
+            item = await asyncio.to_thread(self._query_mysql_item_by_id, item_id)
         if not item:
             image_url = self._image_url(item_id)
             image_exists = await asyncio.to_thread(self._url_exists, image_url)
@@ -128,6 +134,8 @@ class SpeedItemLookupPlugin(Star):
         mess = item.get("mess") or item.get("type") or "未知类型"
         item_type = item.get("type") or "UNKNOWN"
         lines = [title, f"ID: {item_id}", f"类型: {mess}", f"Type: {item_type}"]
+        if item.get("source") == "mysql":
+            lines.append("来源: MySQL itemallnew")
         if not image_exists:
             lines.append("图片: 未找到")
 
@@ -215,11 +223,151 @@ class SpeedItemLookupPlugin(Star):
         limit = max(1, self._get_int("max_search_results", 10))
         return [item_id for *_prefix, item_id in ranked[:limit]]
 
+    def _search_mysql_by_name(self, query: str) -> list[str]:
+        if not self._mysql_enabled():
+            return []
+        needle = query.strip()
+        if not needle:
+            return []
+        limit = max(1, self._get_int("max_search_results", 10))
+        table = self._mysql_identifier("mysql_table", "itemallnew")
+        id_column = self._mysql_identifier("mysql_id_column", "ID")
+        type_column = self._mysql_identifier("mysql_type_column", "Type")
+        mess_column = self._mysql_identifier("mysql_mess_column", "Mess")
+        name_column = self._mysql_identifier("mysql_name_column", "Name")
+        sql = (
+            f"SELECT `{id_column}` AS item_id, `{type_column}` AS item_type, "
+            f"`{mess_column}` AS mess, `{name_column}` AS name "
+            f"FROM `{table}` "
+            f"WHERE `{name_column}` LIKE %s "
+            f"ORDER BY (`{name_column}` = %s) DESC, "
+            f"(`{name_column}` LIKE %s) DESC, CHAR_LENGTH(`{name_column}`), `{id_column}` "
+            f"LIMIT {limit}"
+        )
+        count_sql = f"SELECT COUNT(*) AS match_count FROM `{table}` WHERE `{name_column}` LIKE %s"
+        like = f"%{needle}%"
+        prefix_like = f"{needle}%"
+        try:
+            with self._mysql_connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(count_sql, (like,))
+                    count_row = cursor.fetchone() or {}
+                    self.mysql_name_match_counts[needle.casefold()] = int(
+                        count_row.get("match_count") or 0
+                    )
+                    cursor.execute(sql, (like, needle, prefix_like))
+                    rows = cursor.fetchall()
+        except Exception as exc:
+            logger.warning(f"SpeedItemLookupPlugin MySQL name fallback failed: {exc}")
+            return []
+        item_ids = []
+        for row in rows:
+            item = self._mysql_row_to_item(row)
+            if not item:
+                continue
+            item_id = str(row.get("item_id") or "").strip()
+            self.mysql_items[item_id] = item
+            item_ids.append(item_id)
+        return item_ids
+
+    def _query_mysql_item_by_id(self, item_id: str) -> dict[str, str] | None:
+        if not self._mysql_enabled() or not str(item_id).isdigit():
+            return None
+        cached = self.mysql_items.get(str(item_id))
+        if cached:
+            return cached
+        table = self._mysql_identifier("mysql_table", "itemallnew")
+        id_column = self._mysql_identifier("mysql_id_column", "ID")
+        type_column = self._mysql_identifier("mysql_type_column", "Type")
+        mess_column = self._mysql_identifier("mysql_mess_column", "Mess")
+        name_column = self._mysql_identifier("mysql_name_column", "Name")
+        sql = (
+            f"SELECT `{id_column}` AS item_id, `{type_column}` AS item_type, "
+            f"`{mess_column}` AS mess, `{name_column}` AS name "
+            f"FROM `{table}` WHERE `{id_column}` = %s LIMIT 1"
+        )
+        try:
+            with self._mysql_connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, (int(item_id),))
+                    row = cursor.fetchone()
+        except Exception as exc:
+            logger.warning(f"SpeedItemLookupPlugin MySQL ID fallback failed: {exc}")
+            return None
+        item = self._mysql_row_to_item(row)
+        if item:
+            self.mysql_items[str(item_id)] = item
+        return item
+
+    def _mysql_row_to_item(self, row: dict[str, Any] | None) -> dict[str, str] | None:
+        if not row:
+            return None
+        item_id = str(row.get("item_id") or "").strip()
+        if not item_id:
+            return None
+        return {
+            "name": str(row.get("name") or ""),
+            "type": str(row.get("item_type") or ""),
+            "mess": str(row.get("mess") or ""),
+            "source": "mysql",
+        }
+
+    def _mysql_enabled(self) -> bool:
+        if not self._get_bool("mysql_fallback_enabled", False):
+            return False
+        return bool(
+            str(self._get("mysql_host", "") or "").strip()
+            and str(self._get("mysql_user", "") or "").strip()
+            and str(self._get("mysql_password", "") or "").strip()
+            and str(self._get("mysql_database", "") or "").strip()
+        )
+
+    def _mysql_connection(self):
+        try:
+            import pymysql
+            import pymysql.cursors
+        except ImportError as exc:
+            raise RuntimeError("PyMySQL is not installed in AstrBot runtime") from exc
+        return pymysql.connect(
+            host=str(self._get("mysql_host", "") or "").strip(),
+            port=self._get_int("mysql_port", 3306),
+            user=str(self._get("mysql_user", "") or "").strip(),
+            password=str(self._get("mysql_password", "") or ""),
+            database=str(self._get("mysql_database", "player") or "player").strip(),
+            charset=str(self._get("mysql_charset", "utf8mb4") or "utf8mb4").strip(),
+            connect_timeout=max(1, self._get_int("mysql_timeout_sec", 3)),
+            read_timeout=max(1, self._get_int("mysql_timeout_sec", 3)),
+            write_timeout=max(1, self._get_int("mysql_timeout_sec", 3)),
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+
+    def _mysql_identifier(self, key: str, default: str) -> str:
+        value = str(self._get(key, default) or default).strip()
+        if re.fullmatch(r"[A-Za-z0-9_]+", value):
+            return value
+        logger.warning(
+            f"SpeedItemLookupPlugin ignored unsafe MySQL identifier {key}={value!r}"
+        )
+        return default
+
+    def _get_cached_item(self, item_id: str) -> dict[str, str] | None:
+        return self.items.get(str(item_id)) or self.mysql_items.get(str(item_id))
+
+    def _count_cached_mysql_name_matches(self, query: str) -> int:
+        needle = query.casefold().strip()
+        if needle in self.mysql_name_match_counts:
+            return self.mysql_name_match_counts[needle]
+        return sum(
+            1
+            for item in self.mysql_items.values()
+            if needle and needle in str(item.get("name") or "").casefold()
+        )
+
     def _format_choices(self, query: str, item_ids: list[str]) -> str:
         total_matches = self._count_name_matches(query)
         lines = [f"找到 {total_matches} 个匹配「{query}」的物品，显示前 {len(item_ids)} 个："]
         for index, item_id in enumerate(item_ids, 1):
-            item = self.items[item_id]
+            item = self._get_cached_item(item_id) or {}
             name = item.get("name") or "未命名"
             mess = item.get("mess") or item.get("type") or "未知类型"
             lines.append(f"{index}. {name} / ID: {item_id} / {mess}")
@@ -229,7 +377,10 @@ class SpeedItemLookupPlugin(Star):
 
     def _count_name_matches(self, query: str) -> int:
         needle = query.casefold().strip()
-        return sum(1 for *_prefix, haystack in self.name_index if needle in haystack)
+        local_count = sum(1 for *_prefix, haystack in self.name_index if needle in haystack)
+        if local_count:
+            return local_count
+        return self._count_cached_mysql_name_matches(query)
 
     def _store_pending_choices(
         self,

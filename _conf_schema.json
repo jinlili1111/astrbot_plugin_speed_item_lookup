@@ -33,5 +33,70 @@
     "description": "二轮序号筛选的有效期秒数",
     "type": "int",
     "default": 300
+  },
+  "mysql_fallback_enabled": {
+    "description": "本地未收录时是否启用 MySQL itemallnew 兜底查询",
+    "type": "bool",
+    "default": false
+  },
+  "mysql_host": {
+    "description": "MySQL 主机地址；AstrBot 容器访问宿主机通常填 Docker 网关 IP",
+    "type": "string",
+    "default": ""
+  },
+  "mysql_port": {
+    "description": "MySQL 端口",
+    "type": "int",
+    "default": 3306
+  },
+  "mysql_user": {
+    "description": "MySQL 只读用户名",
+    "type": "string",
+    "default": ""
+  },
+  "mysql_password": {
+    "description": "MySQL 只读用户密码",
+    "type": "string",
+    "default": ""
+  },
+  "mysql_database": {
+    "description": "MySQL 数据库名",
+    "type": "string",
+    "default": "player"
+  },
+  "mysql_table": {
+    "description": "MySQL 物品表名",
+    "type": "string",
+    "default": "itemallnew"
+  },
+  "mysql_id_column": {
+    "description": "MySQL 物品 ID 字段",
+    "type": "string",
+    "default": "ID"
+  },
+  "mysql_name_column": {
+    "description": "MySQL 物品名称字段",
+    "type": "string",
+    "default": "Name"
+  },
+  "mysql_type_column": {
+    "description": "MySQL 物品 Type 字段",
+    "type": "string",
+    "default": "Type"
+  },
+  "mysql_mess_column": {
+    "description": "MySQL 物品类型说明字段",
+    "type": "string",
+    "default": "Mess"
+  },
+  "mysql_charset": {
+    "description": "MySQL 连接字符集",
+    "type": "string",
+    "default": "utf8mb4"
+  },
+  "mysql_timeout_sec": {
+    "description": "MySQL 连接与查询超时秒数",
+    "type": "int",
+    "default": 3
   }
 }
