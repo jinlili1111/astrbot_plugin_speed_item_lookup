@@ -13,6 +13,11 @@ import astrbot.api.message_components as Comp
 from astrbot.api.star import Context, Star
 
 
+class WakeCommandFilter(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
+        return bool(getattr(event, "is_at_or_wake_command", False))
+
+
 class SpeedItemLookupPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -40,7 +45,8 @@ class SpeedItemLookupPlugin(Star):
         if result:
             yield result.stop_event()
 
-    @filter.regex(r"^/\s*\S.*")
+    @filter.regex(r"^/?\s*\S.*")
+    @filter.custom_filter(WakeCommandFilter, False)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def lookup_speed_item_short_slash(self, event: AstrMessageEvent):
         query = self._extract_short_slash_query(event.get_message_str())
@@ -182,9 +188,7 @@ class SpeedItemLookupPlugin(Star):
 
     def _extract_short_slash_query(self, message: str) -> str:
         text = re.sub(r"\s+", " ", (message or "").strip())
-        if not text.startswith("/"):
-            return ""
-        query = text[1:].strip()
+        query = text[1:].strip() if text.startswith("/") else text
         if not query:
             return ""
         command = query.split(" ", 1)[0].casefold()
