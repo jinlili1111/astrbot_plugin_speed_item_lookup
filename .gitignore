@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 .venv/
 .env
+data/usage_stats.json
+data/usage_stats.json.tmp

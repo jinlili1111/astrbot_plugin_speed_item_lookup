@@ -19,6 +19,11 @@
     "type": "string",
     "default": "https://iips.speed.qq.com/images"
   },
+  "local_image_dir": {
+    "description": "本地物品图归档目录：CDN没有该图时从这里发（AstrBot容器内路径）",
+    "type": "string",
+    "default": "/AstrBot/data/speed_item_images"
+  },
   "image_timeout_sec": {
     "description": "图片存在性检查超时秒数",
     "type": "int",
@@ -26,6 +31,16 @@
   },
   "max_search_results": {
     "description": "名称模糊搜索最多展示多少条候选",
+    "type": "int",
+    "default": 10
+  },
+  "track_usage": {
+    "description": "记录物品查询次数，用于 /常用 发送榜",
+    "type": "bool",
+    "default": true
+  },
+  "usage_rank_size": {
+    "description": "/常用 发送榜显示的条数",
     "type": "int",
     "default": 10
   },

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -27,9 +28,11 @@ class SpeedItemLookupPlugin(Star):
         self.mysql_name_match_counts: dict[str, int] = {}
         self.name_index: list[tuple[str, str, str, str, str]] = []
         self.pending_choices: dict[str, dict[str, Any]] = {}
+        self.usage: dict[str, dict[str, dict[str, Any]]] = {}
 
     async def initialize(self):
         await asyncio.to_thread(self._load_items)
+        await asyncio.to_thread(self._load_usage)
         logger.info(
             f"SpeedItemLookupPlugin initialized, loaded {len(self.items)} item names"
         )
@@ -60,6 +63,38 @@ class SpeedItemLookupPlugin(Star):
         )
         if result:
             yield result.stop_event()
+
+    @filter.command("常用", alias={"常用榜", "发送榜"})
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def usage_ranking(self, event: AstrMessageEvent):
+        group_id = str(event.get_group_id() or "").strip()
+        if not self._group_allowed(group_id):
+            return
+        event.should_call_llm(False)
+        stats = self.usage.get(group_id or "private", {})
+        if not stats:
+            yield event.plain_result(
+                "本群还没有物品查询记录。先用 /itemid ID 或 /名称 查询几次，就有常用发送榜啦。"
+            ).stop_event()
+            return
+        size = max(1, self._get_int("usage_rank_size", 10))
+        ranked = sorted(
+            stats.items(),
+            key=lambda kv: (
+                -int(kv[1].get("c", 0)),
+                int(kv[0]) if str(kv[0]).isdigit() else 0,
+            ),
+        )[:size]
+        lines = [f"🏆 常用发送榜 Top {len(ranked)}"]
+        for index, (iid, info) in enumerate(ranked, 1):
+            name = info.get("n") or f"物品{iid}"
+            lines.append(f"{index}. {name}  ID:{iid}  ×{int(info.get('c', 0))}")
+        lines.append("发送 /itemid ID 或 /名称 查看物品详情")
+        chain = [Comp.Plain("\n".join(lines))]
+        image = await self._image_component(ranked[0][0])
+        if image is not None:
+            chain.append(image)
+        yield event.chain_result(chain).stop_event()
 
     async def _lookup_query(
         self,
@@ -116,19 +151,18 @@ class SpeedItemLookupPlugin(Star):
         if not item:
             item = await asyncio.to_thread(self._query_mysql_item_by_id, item_id)
         if not item:
-            image_url = self._image_url(item_id)
-            image_exists = await asyncio.to_thread(self._url_exists, image_url)
-            if not image_exists and self._get_bool("silent_on_image_404", False):
+            image = await self._image_component(item_id)
+            if image is None and self._get_bool("silent_on_image_404", False):
                 return None
-            if not image_exists and not self._get_bool("reply_when_not_found", True):
+            if image is None and not self._get_bool("reply_when_not_found", True):
                 return None
             chain = [Comp.Plain(f"未收录物品ID：{item_id}")]
-            if image_exists:
-                chain.append(Comp.Image.fromURL(image_url))
+            if image is not None:
+                chain.append(image)
             return event.chain_result(chain)
 
-        image_url = self._image_url(item_id)
-        image_exists = await asyncio.to_thread(self._url_exists, image_url)
+        image = await self._image_component(item_id)
+        await self._bump_usage(event.get_group_id(), item_id, item.get("name") or "")
 
         title = item.get("name") or f"物品 {item_id}"
         mess = item.get("mess") or item.get("type") or "未知类型"
@@ -136,12 +170,12 @@ class SpeedItemLookupPlugin(Star):
         lines = [title, f"ID: {item_id}", f"类型: {mess}", f"Type: {item_type}"]
         if item.get("source") == "mysql":
             lines.append("来源: MySQL itemallnew")
-        if not image_exists:
+        if image is None:
             lines.append("图片: 未找到")
 
         chain = [Comp.Plain("\n".join(lines))]
-        if image_exists:
-            chain.append(Comp.Image.fromURL(image_url))
+        if image is not None:
+            chain.append(image)
         return event.chain_result(chain)
 
     def _load_items(self):
@@ -170,6 +204,48 @@ class SpeedItemLookupPlugin(Star):
             for item_id, info in self.items.items()
             if info.get("name")
         ]
+
+    def _usage_path(self) -> Path:
+        return Path(__file__).with_name("data") / "usage_stats.json"
+
+    def _load_usage(self):
+        path = self._usage_path()
+        if not path.exists():
+            self.usage = {}
+            return
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                raw = json.load(file)
+            self.usage = raw if isinstance(raw, dict) else {}
+        except Exception as exc:
+            logger.warning(f"SpeedItemLookupPlugin load usage failed: {exc}")
+            self.usage = {}
+
+    async def _bump_usage(self, group_id: Any, item_id: str, name: str) -> None:
+        """记录一次物品查询命中（按群统计），用于 /常用 榜。"""
+        if not self._get_bool("track_usage", True):
+            return
+        key = str(group_id or "private")
+        bucket = self.usage.setdefault(key, {})
+        entry = bucket.setdefault(str(item_id), {"c": 0, "n": ""})
+        entry["c"] = int(entry.get("c", 0)) + 1
+        if name:
+            entry["n"] = name
+        try:
+            data = json.dumps(self.usage, ensure_ascii=False)
+        except Exception:
+            return
+        await asyncio.to_thread(self._write_usage, data)
+
+    def _write_usage(self, data: str) -> None:
+        path = self._usage_path()
+        try:
+            tmp = str(path) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as file:
+                file.write(data)
+            os.replace(tmp, str(path))
+        except Exception as exc:
+            logger.warning(f"SpeedItemLookupPlugin write usage failed: {exc}")
 
     def _group_allowed(self, group_id: str) -> bool:
         allowed = self._get_list("allowed_group_ids")
@@ -200,7 +276,7 @@ class SpeedItemLookupPlugin(Star):
         if not query:
             return ""
         command = query.split(" ", 1)[0].casefold()
-        if command in {"itemid", "物品", "道具"}:
+        if command in {"itemid", "物品", "道具", "常用", "常用榜", "发送榜"}:
             return ""
         return query
 
@@ -440,6 +516,23 @@ class SpeedItemLookupPlugin(Star):
         ).strip()
         base_url = base_url.rstrip("/") or "https://iips.speed.qq.com/images"
         return f"{base_url}/{item_id}.png"
+
+    async def _image_component(self, item_id: str):
+        """CDN 优先：CDN 有图就用 CDN URL；没有则用本地归档文件；都没有返回 None。"""
+        image_url = self._image_url(item_id)
+        if await asyncio.to_thread(self._url_exists, image_url):
+            return Comp.Image.fromURL(image_url)
+        local_path = self._local_image_path(item_id)
+        if local_path:
+            return Comp.Image.fromFileSystem(local_path)
+        return None
+
+    def _local_image_path(self, item_id: str) -> str | None:
+        base_dir = str(self._get("local_image_dir", "/AstrBot/data/speed_item_images") or "").strip()
+        if not base_dir:
+            return None
+        path = os.path.join(base_dir, f"{item_id}.png")
+        return path if os.path.isfile(path) else None
 
     def _url_exists(self, url: str) -> bool:
         timeout = max(1, self._get_int("image_timeout_sec", 6))
